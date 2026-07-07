@@ -1,0 +1,129 @@
+version: '3.9'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: bionexus-postgres
+    environment:
+      POSTGRES_USER: biouser
+      POSTGRES_PASSWORD: biopass
+      POSTGRES_DB: bionexus_db
+      POSTGRES_INITDB_ARGS: "-c timezone=UTC"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U biouser -d bionexus_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bionexus
+
+  redis:
+    image: redis:7-alpine
+    container_name: bionexus-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - bionexus
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bionexus-backend
+    environment:
+      DATABASE_URL: postgresql://biouser:biopass@postgres:5432/bionexus_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      ENVIRONMENT: development
+      DEBUG: "true"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    command: >
+      sh -c "
+      alembic upgrade head &&
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      "
+    networks:
+      - bionexus
+
+  celery:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: bionexus-celery
+    environment:
+      DATABASE_URL: postgresql://biouser:biopass@postgres:5432/bionexus_db
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      ENVIRONMENT: development
+    depends_on:
+      - postgres
+      - redis
+    volumes:
+      - ./backend:/app
+      - /app/__pycache__
+    command: celery -A app.tasks worker --loglevel=info
+    networks:
+      - bionexus
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: bionexus-frontend
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: npm run dev
+    depends_on:
+      - backend
+    networks:
+      - bionexus
+
+  nginx:
+    image: nginx:alpine
+    container_name: bionexus-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - bionexus
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  bionexus:
+    driver: bridge
